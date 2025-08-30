@@ -1,12 +1,10 @@
 [package]
-name = "methods"
+name = "zk-bug-bounty-methods"
 version = "0.1.0"
 edition = "2021"
-publish = false
 
 [dependencies]
-risc0-zkvm = { version = "1.2", default-features = false }
-serde = { version = "1.0", features = ["derive"] }
+risc0-build = { version = "1.0" }
 
 [build-dependencies]
-risc0-build = "1.2"
+risc0-build = { version = "1.0" }
