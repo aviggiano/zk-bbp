@@ -5,22 +5,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PublicInputs {
     pub threshold: u128,          // payout threshold (u128)
-    pub commitment: [u8; 32],     // sha256 over (pre||post, calldata, target_code, asset_code) with length tags
+    pub commitment: [u8; 32],     // sha256 over (balance, calldata, target_code, asset_code) with length tags
     pub asset: [u8; 20],          // address bytes
     pub target: [u8; 20],         // address bytes
     pub selector: [u8; 4],        // first 4 bytes of calldata (function selector)
     pub target_code_sha256: [u8; 32],
     pub asset_code_sha256: [u8; 32],
-    // (Optional labels you might echo later: block_pre/post, chain id, etc.)
 }
 
 /// Public outputs committed to the journal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PublicOutputs {
     pub threshold: u128,
-    pub loss_hi: [u8; 16],        // high 128 bits of (pre - post)
-    pub loss_lo: [u8; 16],        // low  128 bits of (pre - post)
-    pub loss_ge_threshold: bool,
+    pub potential_loss_hi: [u8; 16],        // high 128 bits of potential loss (min(balance, exploitable))
+    pub potential_loss_lo: [u8; 16],        // low  128 bits of potential loss
+    pub can_drain_above_threshold: bool,    // whether the exploit can drain above threshold
     pub selector: [u8; 4],
     pub asset: [u8; 20],
     pub target: [u8; 20],

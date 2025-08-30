@@ -21,14 +21,9 @@ struct Args {
     #[arg(long)]
     target: String,
 
-    /// Either explicit pre/post blocks (decimal)...
+    /// Block number to use as the pinned state (decimal)
     #[arg(long)]
-    block_pre: Option<u64>,
-    #[arg(long)]
-    block_post: Option<u64>,
-    /// ...or derive them from a tx (pre = block-1, post = block)
-    #[arg(long)]
-    tx: Option<String>,
+    block: u64,
 
     /// Path to PoC calldata (hex string file starting with 0x, or raw bytes)
     #[arg(long)]
@@ -47,26 +42,11 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let client = Client::new();
 
-    // ----------------- Resolve blocks -----------------
-    let (pre_block, post_block) = if let Some(tx) = args.tx.as_ref() {
-        let block = get_tx_block_number(&client, &args.rpc, tx)?;
-        if block == 0 { bail!("tx in block 0; cannot set pre = -1"); }
-        (block - 1, block)
-    } else {
-        let pre = args.block_pre.ok_or_else(|| anyhow!("--block-pre required (or use --tx)"))?;
-        let post = args.block_post.ok_or_else(|| anyhow!("--block-post required (or use --tx)"))?;
-        (pre, post)
-    };
-
-    // ----------------- Fetch balances at pre/post -----------------
-    let pre_balance = erc20_balance_of_at(&client, &args.rpc, &args.asset, &args.target, pre_block)
-        .with_context(|| "fetching pre balance")?;
-    let post_balance = erc20_balance_of_at(&client, &args.rpc, &args.asset, &args.target, post_block)
-        .with_context(|| "fetching post balance")?;
-
-    // ----------------- Fetch code at pre-block -----------------
-    let target_code = get_code_at(&client, &args.rpc, &args.target, pre_block)?;
-    let asset_code = get_code_at(&client, &args.rpc, &args.asset, pre_block)?;
+    // ----------------- Fetch balance and code at pinned block -----------------
+    let balance = erc20_balance_of_at(&client, &args.rpc, &args.asset, &args.target, args.block)
+        .with_context(|| "fetching balance")?;
+    let target_code = get_code_at(&client, &args.rpc, &args.target, args.block)?;
+    let asset_code = get_code_at(&client, &args.rpc, &args.asset, args.block)?;
     let target_sha: [u8; 32] = Sha256::digest(&target_code).into();
     let asset_sha: [u8; 32] = Sha256::digest(&asset_code).into();
 
@@ -79,12 +59,8 @@ fn main() -> Result<()> {
     selector.copy_from_slice(&calldata_bytes[0..4]);
 
     // ----------------- Build witness chunks -----------------
-    let mut pre_post = [0u8; 64];
-    pre_post[0..32].copy_from_slice(&pre_balance);
-    pre_post[32..64].copy_from_slice(&post_balance);
-
     // Compute the commitment exactly like the guest does
-    let commitment = commit_all_host(&pre_post, &calldata_bytes, &target_code, &asset_code);
+    let commitment = commit_all_host(&balance, &calldata_bytes, &target_code, &asset_code);
 
     // ----------------- Public inputs -----------------
     let asset20 = addr_to_20(&args.asset)?;
@@ -104,7 +80,7 @@ fn main() -> Result<()> {
     // ----------------- Prove in zkVM -----------------
     let env = ExecutorEnv::builder()
         .write(&pubin)?
-        .write(&pre_post)?
+        .write(&balance)?
         .write(&calldata_bytes)?
         .write(&target_code)?
         .write(&asset_code)?
@@ -115,17 +91,16 @@ fn main() -> Result<()> {
 
     // ----------------- Journal / output -----------------
     let journal: PublicOutputs = receipt.journal.decode()?;
-    let loss_hex = format!("0x{}{}", hex::encode(journal.loss_hi), hex::encode(journal.loss_lo));
+    let potential_loss_hex = format!("0x{}{}", hex::encode(journal.potential_loss_hi), hex::encode(journal.potential_loss_lo));
 
     println!("✅ Proof verified");
-    println!("• pre_block  = {pre_block}");
-    println!("• post_block = {post_block}");
+    println!("• block      = {}", args.block);
     println!("• asset      = {}", &args.asset);
     println!("• target     = {}", &args.target);
     println!("• selector   = 0x{}", hex::encode(journal.selector));
     println!("• threshold  = {}", journal.threshold);
-    println!("• loss       = {loss_hex}");
-    println!("• loss ≥ thr = {}", journal.loss_ge_threshold);
+    println!("• potential_loss = {potential_loss_hex}");
+    println!("• can_drain_above_thr = {}", journal.can_drain_above_threshold);
 
     if let Some(out) = args.out {
         fs::write(out, serde_json::to_vec_pretty(&journal)?)?;
@@ -135,24 +110,6 @@ fn main() -> Result<()> {
 
 // ----------------- Helpers -----------------
 
-fn get_tx_block_number(client: &Client, rpc: &str, tx_hash: &str) -> Result<u64> {
-    let res = client
-        .post(rpc)
-        .header(CONTENT_TYPE, "application/json")
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_getTransactionReceipt",
-            "params": [tx_hash]
-        }))
-        .send()?
-        .error_for_status()?
-        .json::<serde_json::Value>()?;
-
-    let hexnum = res["result"]["blockNumber"]
-        .as_str().ok_or_else(|| anyhow!("no blockNumber in receipt"))?;
-    Ok(u64::from_str_radix(hexnum.trim_start_matches("0x"), 16)?)
-}
 
 fn erc20_balance_of_at(
     client: &Client,
@@ -232,13 +189,13 @@ fn read_calldata(path: &PathBuf) -> Result<Vec<u8>> {
 }
 
 // Must mirror the guest's commitment exactly.
-fn commit_all_host(pre_post: &[u8; 64], calldata: &[u8], target_code: &[u8], asset_code: &[u8]) -> [u8; 32] {
-    // sha256( "BBP" || len(pre_post) || pre_post || len(calldata) || calldata
+fn commit_all_host(balance: &[u8; 32], calldata: &[u8], target_code: &[u8], asset_code: &[u8]) -> [u8; 32] {
+    // sha256( "BBP" || len(balance) || balance || len(calldata) || calldata
     //                 || len(target_code)|| target_code || len(asset_code)|| asset_code )
     let mut hasher = Sha256::new();
     hasher.update(b"BBP");
-    hasher.update((pre_post.len() as u32).to_be_bytes());
-    hasher.update(pre_post);
+    hasher.update((balance.len() as u32).to_be_bytes());
+    hasher.update(balance);
     hasher.update((calldata.len() as u32).to_be_bytes());
     hasher.update(calldata);
     hasher.update((target_code.len() as u32).to_be_bytes());
