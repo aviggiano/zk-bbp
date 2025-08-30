@@ -5,6 +5,6 @@ edition = "2021"
 
 [dependencies]
 risc0-zkvm = { version = "1.0", features = ["prove"] }
-guest = { path = "../guest" }
+methods-guest = { path = "../methods/guest" }
 zk-bug-bounty-methods = { path = "../methods" }
 serde = { version = "1.0", features = ["derive"] }

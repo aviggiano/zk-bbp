@@ -1086,14 +1086,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
-name = "guest"
-version = "0.1.0"
-dependencies = [
- "risc0-zkvm",
- "serde",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1130,7 +1122,7 @@ checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
 name = "host"
 version = "0.1.0"
 dependencies = [
- "guest",
+ "methods-guest",
  "risc0-zkvm",
  "serde",
  "zk-bug-bounty-methods",
