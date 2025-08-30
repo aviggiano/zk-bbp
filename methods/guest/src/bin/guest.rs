@@ -3,49 +3,52 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+use methods::{PublicInputs, PublicOutputs};
 use risc0_zkvm::guest::env;
 use risc0_zkvm::sha;
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct PublicInputs {
-    pub threshold: u128,
-    pub commitment: [u8; 32],
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct PublicOutputs {
-    pub threshold: u128,
-    pub loss_hi: [u8; 16],
-    pub loss_lo: [u8; 16],
-    pub loss_ge_threshold: bool,
-}
 
 risc0_zkvm::guest::entry!(main);
 
 fn main() {
-    // Read public inputs and private witness.
+    // Read: public inputs, then witness chunks in this exact order.
     let pubin: PublicInputs = env::read();
-    // Witness blob is 64 bytes: pre_balance (32B big-endian) || post_balance (32B big-endian)
-    let witness: [u8; 64] = env::read();
 
-    // 1) Recompute commitment = sha256(witness)
-    let digest = sha::sha256(&witness);
-    assert_eq!(digest.as_bytes(), &pubin.commitment, "bad commitment");
+    // Witness parts:
+    //  (1) pre||post (64 bytes big-endian u256s)
+    let pre_post: [u8; 64] = env::read();
+    //  (2) calldata (opaque; we only check selector matches pub input)
+    let calldata: Vec<u8> = env::read();
+    //  (3) target bytecode
+    let target_code: Vec<u8> = env::read();
+    //  (4) asset bytecode
+    let asset_code: Vec<u8> = env::read();
 
-    // 2) Parse pre/post as big-endian 32-byte unsigned ints
+    // ---- Recompute the overall commitment over length-tagged blobs ----
+    let commitment = commit_all(&pre_post, &calldata, &target_code, &asset_code);
+    assert_eq!(commitment, pubin.commitment, "commitment mismatch");
+
+    // ---- Sanity checks on calldata & code digests (bind PoC to actual code) ----
+    // Calldata must be at least 4 bytes for selector
+    assert!(calldata.len() >= 4, "calldata too short");
+    assert_eq!(&calldata[0..4], &pubin.selector, "selector mismatch");
+
+    // SHA-256 of code blobs must match public digests
+    let t_sha = sha::sha256(&target_code);
+    let a_sha = sha::sha256(&asset_code);
+    assert_eq!(t_sha.as_bytes(), &pubin.target_code_sha256, "target code digest mismatch");
+    assert_eq!(a_sha.as_bytes(), &pubin.asset_code_sha256, "asset code digest mismatch");
+
+    // ---- Parse balances & check threshold ----
     let mut pre = [0u8; 32];
     let mut post = [0u8; 32];
-    pre.copy_from_slice(&witness[0..32]);
-    post.copy_from_slice(&witness[32..64]);
+    pre.copy_from_slice(&pre_post[0..32]);
+    post.copy_from_slice(&pre_post[32..64]);
 
-    // 3) loss = max(pre - post, 0)
     let loss = sub_u256_be_saturating(&pre, &post);
-
-    // 4) Check loss >= threshold (u128)
     let ge = ge_u256_vs_u128(&loss, pubin.threshold);
 
-    // 5) Commit public outputs
+    // ---- Commit outputs ----
     let mut hi = [0u8; 16];
     let mut lo = [0u8; 16];
     hi.copy_from_slice(&loss[0..16]);
@@ -56,14 +59,37 @@ fn main() {
         loss_hi: hi,
         loss_lo: lo,
         loss_ge_threshold: ge,
+        selector: pubin.selector,
+        asset: pubin.asset,
+        target: pubin.target,
     };
     env::commit(&out);
+}
+
+// Compute: sha256( "BBP" || len(pre_post) || pre_post || len(calldata) || calldata
+//                     || len(target_code) || target_code || len(asset_code) || asset_code )
+fn commit_all(pre_post: &[u8; 64], calldata: &[u8], target_code: &[u8], asset_code: &[u8]) -> [u8; 32] {
+    let mut st = sha::Impl::new();
+    st.update(b"BBP");
+    write_len(&mut st, pre_post.len() as u32);
+    st.update(pre_post);
+    write_len(&mut st, calldata.len() as u32);
+    st.update(calldata);
+    write_len(&mut st, target_code.len() as u32);
+    st.update(target_code);
+    write_len(&mut st, asset_code.len() as u32);
+    st.update(asset_code);
+    *st.finalize().as_bytes()
+}
+
+fn write_len(st: &mut sha::Impl, n: u32) {
+    let be = n.to_be_bytes();
+    st.update(&be);
 }
 
 // ---------- helpers (big-endian arithmetic) ----------
 
 fn sub_u256_be_saturating(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    // Compute a - b with borrow; if underflow, return 0.
     let mut out = [0u8; 32];
     let mut borrow: u16 = 0;
     for i in (0..32).rev() {
@@ -72,33 +98,19 @@ fn sub_u256_be_saturating(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
         let mut diff = av.wrapping_sub(bv + borrow);
         if av < bv + borrow {
             borrow = 1;
-            diff = diff.wrapping_add(1 << 8); // borrow from next byte
+            diff = diff.wrapping_add(1 << 8);
         } else {
             borrow = 0;
         }
         out[i] = (diff & 0xff) as u8;
     }
-    if borrow != 0 {
-        // underflow => saturate to zero
-        [0u8; 32]
-    } else {
-        out
-    }
+    if borrow != 0 { [0u8; 32] } else { out }
 }
 
 fn ge_u256_vs_u128(a: &[u8; 32], thr: u128) -> bool {
-    // If high 128 bits are non-zero, a >= 2^128 > thr (unless thr == max u128); treat as true.
-    let mut hi_nonzero = false;
     for b in &a[0..16] {
-        if *b != 0 {
-            hi_nonzero = true;
-            break;
-        }
+        if *b != 0 { return true; }
     }
-    if hi_nonzero {
-        return true;
-    }
-    // Compare low 128 bits (big-endian) to thr
     let mut lo_bytes = [0u8; 16];
     lo_bytes.copy_from_slice(&a[16..32]);
     let lo = u128::from_be_bytes(lo_bytes);

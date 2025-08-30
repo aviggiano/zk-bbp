@@ -7,7 +7,8 @@ edition = "2021"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
-risc0-zkvm = "3.0"
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+risc0-zkvm = "1"
 sha2 = "0.10"
 methods = { path = "../methods" }
 serde = { version = "1", features = ["derive"] }
